@@ -1,11 +1,36 @@
+// Read FAL_API_KEYS (comma-separated) from environment variable
+const falApiKeysEnv = Deno.env.get("FAL_API_KEYS");
+let AI_KEYS = [];
+if (falApiKeysEnv) {
+    AI_KEYS = falApiKeysEnv.split(',').map(key => key.trim()).filter(key => key.length > 0);
+    if (AI_KEYS.length === 0) {
+        console.warn("FAL_API_KEYS environment variable is set but contains no valid keys after parsing. Please ensure it's a comma-separated list of non-empty keys.");
+    } else {
+        console.log(`Successfully loaded ${AI_KEYS.length} FAL API Key(s) from environment variable.`);
+    }
+} else {
+    console.warn("FAL_API_KEYS environment variable not set. AI functionality will be severely limited or fail. Please set it in your Deno Deploy project settings.");
+}
+
+// Read CUSTOM_ACCESS_KEY from environment variable
+const customAccessKeyEnv = Deno.env.get("MY_CUSTOM_ACCESS_KEY");
+let CUSTOM_ACCESS_KEY = "";
+if (customAccessKeyEnv) {
+    CUSTOM_ACCESS_KEY = customAccessKeyEnv;
+    console.log("Successfully loaded MY_CUSTOM_ACCESS_KEY from environment variable.");
+} else {
+    console.warn("MY_CUSTOM_ACCESS_KEY environment variable not set. Client authorization will likely fail. Please set it in your Deno Deploy project settings.");
+}
+
+
 export default {
-    async fetch(request, env) {
+    async fetch(request, env) { // env is part of Cloudflare Workers signature, not directly used here but common pattern
       const url = new URL(request.url);
       const path = url.pathname;
       if (path === '/v1/chat/completions' && request.method === 'POST') {
-        return await handleChatCompletions(request, env);
+        return await handleChatCompletions(request);
       } else if (path === '/v1/images/generations' && request.method === 'POST') {
-        return await handleImageGenerations(request, env);
+        return await handleImageGenerations(request);
       } else if (path === '/v1/models' && request.method === 'GET') {
         return await listModels();
       } else {
@@ -16,12 +41,7 @@ export default {
     }
   };
 
-  const AI_KEYS = [
-    "xxx-xxx-xxx", // 请替换成您的 FAL_KEY
-    // "yyy-yyy-yyy"  // 可以添加更多 FAL_KEY
-  ];
-  const CUSTOM_ACCESS_KEY = "123321"; // 请替换成您自定义的 OPENAI_API_KEY
-
+  // MODEL_URLS remains the same as your previous version
   const MODEL_URLS = {
     "FLUX-pro": {
       "submit_url": "https://queue.fal.run/fal-ai/flux-pro/v1.1-ultra",
@@ -43,8 +63,8 @@ export default {
       "status_base_url": "https://queue.fal.run/fal-ai/ideogram",
       "image-to-image": false, "multi-image-input":false
     },
-    "dall-e-3": {
-      "submit_url": "https://queue.fal.run/fal-ai/flux/dev",
+    "dall-e-3": { // This seems to be a placeholder or an alias in your original config
+      "submit_url": "https://queue.fal.run/fal-ai/flux/dev", // Example, ensure this is correct if used
       "status_base_url": "https://queue.fal.run/fal-ai/flux",
       "image-to-image": false, "multi-image-input":false
     },
@@ -81,8 +101,8 @@ export default {
   };
 
   function getRandomApiKey() {
-    if (AI_KEYS.length === 0 || (AI_KEYS.length === 1 && AI_KEYS[0] === "xxx-xxx-xxx")) {
-        console.error("AI_KEYS array is empty or not configured. Please provide FAL API keys.");
+    if (AI_KEYS.length === 0) {
+        console.error("getRandomApiKey: No FAL API keys available from environment variable FAL_API_KEYS.");
         return null;
     }
     const randomIndex = Math.floor(Math.random() * AI_KEYS.length);
@@ -96,23 +116,32 @@ export default {
     else if (authHeader.startsWith('Key ')) userKey = authHeader.substring(4);
     else userKey = authHeader;
 
-    if (userKey !== CUSTOM_ACCESS_KEY) return { valid: false, userKey };
+    if (!CUSTOM_ACCESS_KEY) {
+        console.error("extractAndValidateApiKey: MY_CUSTOM_ACCESS_KEY is not set in environment. Cannot validate user key.");
+        return { valid: false, userKey, error: "Server authorization misconfiguration." };
+    }
+    if (userKey !== CUSTOM_ACCESS_KEY) {
+        console.warn(`extractAndValidateApiKey: Invalid user key provided: ${userKey ? userKey.substring(0,5)+'...' : 'empty'}`);
+        return { valid: false, userKey, error: "Invalid API key." };
+    }
 
     const randomApiKey = getRandomApiKey();
-    if (!randomApiKey) return { valid: false, userKey, error: "No Fal.ai API keys available in server configuration." };
-    // console.log(`Selected random API key: ${randomApiKey.substring(0, 3)}...`);
+    if (!randomApiKey) {
+        return { valid: false, userKey, error: "Server configuration error: No Fal.ai API keys available. Please check the FAL_API_KEYS environment variable on the server." };
+    }
+    // console.log(`Selected random Fal API key: ${randomApiKey.substring(0, 3)}...`);
     return { valid: true, userKey, apiKey: randomApiKey };
   }
 
   function parseKlingParamsFromPrompt(promptText) {
     const params = {
-        duration: "5", // Default from fal.ai docs for kling-video-v2.1-master
-        aspect_ratio: "16:9", // Default
-        negative_prompt: "blur, distort, and low quality", // Default
-        cfg_scale: 0.5, // Default
+        duration: "5",
+        aspect_ratio: "16:9",
+        negative_prompt: "blur, distort, and low quality",
+        cfg_scale: 0.5,
         cleaned_prompt: promptText
     };
-    let tempPrompt = ` ${promptText} `; // Add spaces for easier regex matching at boundaries
+    let tempPrompt = ` ${promptText} `;
 
     const patterns = {
         duration: /(?:\s)(?:duration|dur):\s*("?(5|10)"?)(?=\s)/i,
@@ -122,39 +151,20 @@ export default {
     };
 
     let match;
-
     match = tempPrompt.match(patterns.duration);
-    if (match) {
-        params.duration = match[2];
-        tempPrompt = tempPrompt.replace(match[0], " ");
-    }
-
+    if (match) { params.duration = match[2]; tempPrompt = tempPrompt.replace(match[0], " "); }
     match = tempPrompt.match(patterns.aspect_ratio);
-    if (match) {
-        params.aspect_ratio = match[2];
-        tempPrompt = tempPrompt.replace(match[0], " ");
-    }
-    
+    if (match) { params.aspect_ratio = match[2]; tempPrompt = tempPrompt.replace(match[0], " "); }
     match = tempPrompt.match(patterns.negative_prompt);
-    if (match) {
-        params.negative_prompt = (match[2] || match[3]).replace(/"/g, '').trim();
-        tempPrompt = tempPrompt.replace(match[0], " ");
-    }
-
+    if (match) { params.negative_prompt = (match[2] || match[3]).replace(/"/g, '').trim(); tempPrompt = tempPrompt.replace(match[0], " ");}
     match = tempPrompt.match(patterns.cfg_scale);
-    if (match) {
-        const cfgVal = parseFloat(match[1]);
-        if (!isNaN(cfgVal)) {
-            params.cfg_scale = cfgVal;
-            tempPrompt = tempPrompt.replace(match[0], " ");
-        }
-    }
+    if (match) { const cfgVal = parseFloat(match[1]); if (!isNaN(cfgVal)) { params.cfg_scale = cfgVal; tempPrompt = tempPrompt.replace(match[0], " "); }}
     
     params.cleaned_prompt = tempPrompt.replace(/\s\s+/g, ' ').trim();
     return params;
   }
 
-  async function handleChatCompletions(request, env) {
+  async function handleChatCompletions(request) {
     const authResult = extractAndValidateApiKey(request);
     if (!authResult.valid) {
       return new Response(JSON.stringify({ error: { message: authResult.error || "Invalid API key.", type: "authentication_error" } }),
@@ -169,16 +179,22 @@ export default {
     }
 
     const messages = openaiRequest.messages || [];
-    const model = openaiRequest.model || 'dall-e-3';
+    const model = openaiRequest.model || 'dall-e-3'; // Default model if not specified
     const stream = openaiRequest.stream === true;
-    console.log(`Model: ${model}, Stream: ${stream}`);
+    // console.log(`ChatCompletions: Model: ${model}, Stream: ${stream}`);
 
-    const modelConfig = MODEL_URLS[model] || MODEL_URLS["dall-e-3"];
+    const modelIdToUse = MODEL_URLS[model] ? model : "dall-e-3"; // Fallback to a default if model key doesn't exist
+    const modelConfig = MODEL_URLS[modelIdToUse];
+    if (!modelConfig) {
+        console.error(`Model configuration for "${modelIdToUse}" not found.`);
+         return new Response(JSON.stringify({ error: { message: `Model configuration for "${modelIdToUse}" not found.`, type: "invalid_request_error" } }),
+            { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
     const isVideoModel = modelConfig.is_video_model || false;
 
     let prompt = "";
     let imageUrl = null;
-    let imageUrls = []; // For multi-image models (not kling)
+    let imageUrls = [];
 
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === 'user') {
@@ -197,7 +213,6 @@ export default {
     }
 
     if ((modelConfig["image-to-image"] || isVideoModel) && !imageUrl && imageUrls.length === 0) {
-      // Attempt to find last AI generated image if no image in current user message
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].role === 'assistant') {
           const assistantContent = messages[i].content;
@@ -205,11 +220,7 @@ export default {
             const imageMatches = assistantContent.match(/!\[.*?\]\((https?:\/\/[^\)]+)\)/g);
             if (imageMatches && imageMatches.length > 0) {
               const urlMatch = imageMatches[imageMatches.length - 1].match(/!\[.*?\]\((https?:\/\/[^\)]+)\)/);
-              if (urlMatch && urlMatch[1]) {
-                imageUrl = urlMatch[1];
-                console.log(`Using image from chat history: ${imageUrl.substring(0,50)}...`);
-                break;
-              }
+              if (urlMatch && urlMatch[1]) { imageUrl = urlMatch[1]; /* console.log(`Using image from history: ${imageUrl.substring(0,50)}...`); */ break; }
             }
           }
         }
@@ -226,17 +237,17 @@ export default {
         }
         klingParams = parseKlingParamsFromPrompt(prompt);
         actualPromptForFal = klingParams.cleaned_prompt;
-        console.log("Kling Params Parsed:", klingParams);
+        // console.log("Kling Params Parsed:", klingParams);
         if (!actualPromptForFal) {
-             return new Response(JSON.stringify({ error: { message: "Video generation requires a descriptive prompt, even with parameters. The descriptive part of your prompt is empty.", type: "invalid_request_error" } }),
+             return new Response(JSON.stringify({ error: { message: "Video generation requires a descriptive prompt for the video content, even when using parameters. The descriptive part of your prompt is empty.", type: "invalid_request_error" } }),
                 { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
     }
 
-    if (!actualPromptForFal && !isVideoModel && !modelConfig["image-to-image"]) { // Text-to-image model with empty prompt
+    if (!actualPromptForFal && !isVideoModel && !modelConfig["image-to-image"]) {
         return createStreamingDefaultResponse(model, "Please describe the image you want to generate.");
     }
-    console.log(`Effective prompt for Fal API: ${actualPromptForFal}`);
+    // console.log(`Effective prompt for Fal API: ${actualPromptForFal}`);
 
     const falRequest = {};
     if (isVideoModel && klingParams) {
@@ -246,26 +257,25 @@ export default {
         falRequest.aspect_ratio = klingParams.aspect_ratio;
         falRequest.negative_prompt = klingParams.negative_prompt;
         falRequest.cfg_scale = klingParams.cfg_scale;
-    } else { // Image models
-        falRequest.prompt = actualPromptForFal; // Can be empty for image-to-image
+    } else {
+        falRequest.prompt = actualPromptForFal;
         falRequest.num_images = openaiRequest.n || 1;
-        if (modelConfig["image-to-image"]) { // Includes standard image-to-image
+        if (modelConfig["image-to-image"]) {
             if (modelConfig["multi-image-input"]) {
                 if (imageUrls.length > 0) falRequest.image_urls = imageUrls;
-                else if (imageUrl) falRequest.image_urls = [imageUrl]; // Send as array even if one
+                else if (imageUrl) falRequest.image_urls = [imageUrl];
             } else {
                 if (imageUrl) falRequest.image_url = imageUrl;
-                else if (imageUrls.length > 0) falRequest.image_url = imageUrls[0]; // Use first if multi not supported
+                else if (imageUrls.length > 0) falRequest.image_url = imageUrls[0];
             }
             if (!falRequest.image_url && (!falRequest.image_urls || falRequest.image_urls.length === 0)) {
-                 // If it's an edit model but no image is found (neither current nor history)
-                 return new Response(JSON.stringify({ error: { message: "This model requires an image for editing/generation. None found.", type: "invalid_request_error" } }),
+                 return new Response(JSON.stringify({ error: { message: "This model requires an image for editing/generation. None found in current message or history.", type: "invalid_request_error" } }),
                     { status: 400, headers: { 'Content-Type': 'application/json' } });
             }
         }
     }
 
-    console.log("Making request to Fal API:", JSON.stringify(falRequest));
+    // console.log("Making request to Fal API:", JSON.stringify(falRequest));
     const falSubmitUrl = modelConfig.submit_url;
     const falStatusBaseUrl = modelConfig.status_base_url;
 
@@ -274,31 +284,33 @@ export default {
       const falResponse = await fetch(falSubmitUrl, { method: 'POST', headers: headers, body: JSON.stringify(falRequest) });
       
       const responseText = await falResponse.text();
-      if (falResponse.status !== 200 && falResponse.status !== 202) { // Fal can return 202 for queued
-        console.error(`Fal API Error (${falSubmitUrl}): ${falResponse.status} - ${responseText}`);
-        return new Response(JSON.stringify({ error: { message: `Fal API submission error: ${responseText}`, type: "fal_api_error", code: falResponse.status } }),
-                           { status: falResponse.status, headers: { 'Content-Type': 'application/json' } });
+      // Fal can return 202 for queued requests which is also a success for submission
+      if (falResponse.status !== 200 && falResponse.status !== 202) {
+        console.error(`Fal API Error (${falSubmitUrl}): ${falResponse.status} - ${responseText.substring(0,500)}`);
+        return new Response(JSON.stringify({ error: { message: `Fal API submission error (status ${falResponse.status}): ${responseText}`, type: "fal_api_error", code: falResponse.status } }),
+                           { status: falResponse.status > 0 ? falResponse.status : 500 , headers: { 'Content-Type': 'application/json' } });
       }
 
       const falData = JSON.parse(responseText);
+      // Fal might return request_id directly, or nested under a "request" object for some endpoints
       const requestId = falData.request_id || (falData.request && falData.request.id);
       if (!requestId) {
         console.error("No request_id in Fal response:", falData);
-        return new Response(JSON.stringify({ error: { message: "Missing request_id from Fal API.", type: "fal_api_error" } }),
+        return new Response(JSON.stringify({ error: { message: "Missing request_id from Fal API after submission.", type: "fal_api_error" } }),
                            { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
-      console.log(`Got request_id: ${requestId}`);
+      // console.log(`Got request_id: ${requestId}`);
       
       let generatedArtifactUrls = [];
-      const maxAttempts = isVideoModel ? 60 : 40; // Longer for video
-      const pollInterval = isVideoModel ? 3000 : 2000;
+      const maxAttempts = isVideoModel ? 70 : 45; // Increased attempts for video
+      const pollInterval = isVideoModel ? 4000 : 2500; // Increased interval for video
 
       if (stream) {
         const readableStream = new ReadableStream({
           async start(controller) {
             const encoder = new TextEncoder();
             const send = (data) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
-            send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+            send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
 
             let attempt = 0;
             let artifactGenerated = false;
@@ -307,17 +319,17 @@ export default {
                 const statusUrl = `${falStatusBaseUrl}/requests/${requestId}/status`;
                 const resultUrl = `${falStatusBaseUrl}/requests/${requestId}`;
                 
-                if (attempt > 0 && attempt % (isVideoModel ? 3 : 5) === 0) { // Progress update
-                     send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { content: isVideoModel ? "视频仍在处理中..." : "图像仍在生成中..." }, finish_reason: null }] });
+                if (attempt > 0 && attempt % (isVideoModel ? 2 : 4) === 0) { // Progress update more frequently for video
+                     send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "视频仍在努力处理中..." : "图像仍在努力生成中..." }, finish_reason: null }] });
                 }
 
                 const statusRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } });
                 if (statusRes.status === 200) {
                   const statusData = await statusRes.json();
-                  console.log(`Poll ${attempt+1}: status ${statusData.status}, progress ${statusData.progress || 'N/A'}`);
+                  // console.log(`Poll ${attempt+1}: status ${statusData.status}, progress ${statusData.progress || 'N/A'}`);
                   if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
-                    const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || "Generation failed at Fal API.";
-                    send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index:0, delta:{ content: `生成失败: ${errorMsg}` }, finish_reason: null }] });
+                    const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
+                    send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `生成失败: ${errorMsg}` }, finish_reason: null }] });
                     artifactGenerated = true; break;
                   }
                   if (statusData.status === "COMPLETED") {
@@ -326,28 +338,28 @@ export default {
                       const resultData = await resultRes.json();
                       if (isVideoModel) {
                         if (resultData.video && resultData.video.url) generatedArtifactUrls.push(resultData.video.url);
-                      } else {
-                        if (resultData.images && resultData.images.length > 0) resultData.images.forEach(img => img.url && generatedArtifactUrls.push(img.url));
-                        else if (resultData.image && resultData.image.url) generatedArtifactUrls.push(resultData.image.url);
+                      } else { // Image models
+                        if (resultData.images && Array.isArray(resultData.images) && resultData.images.length > 0) resultData.images.forEach(img => img && img.url && generatedArtifactUrls.push(img.url));
+                        else if (resultData.image && resultData.image.url) generatedArtifactUrls.push(resultData.image.url); // some models might return a single image object
                       }
 
                       if (generatedArtifactUrls.length > 0) {
                         artifactGenerated = true;
                         let successMsg = isVideoModel ? `视频生成成功!\n\n` : (modelConfig["image-to-image"] ? `图像编辑成功!\n\n` : `图像生成成功!\n\n`);
-                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { content: successMsg }, finish_reason: null }] });
+                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: successMsg }, finish_reason: null }] });
                         generatedArtifactUrls.forEach((url, i) => {
-                          if (i > 0) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { content: "\n\n" }, finish_reason: null }] });
-                          send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { content: isVideoModel ? `视频链接: ${url}` : `![Generated ${i+1}](${url})` }, finish_reason: null }] });
+                          if (i > 0) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: "\n\n" }, finish_reason: null }] });
+                          send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? `视频链接: ${url}` : `![Generated ${i+1}](${url})` }, finish_reason: null }] });
                         });
-                      } else { artifactGenerated = true; send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index:0, delta:{ content: "生成完成，但未找到有效的输出URL。" }, finish_reason: null }] }); }
-                    } else { console.error(`Fal result fetch error: ${resultRes.status} ${await resultRes.text()}`); }
+                      } else { artifactGenerated = true; send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: "生成任务已完成，但未能从Fal API获取有效的输出URL。" }, finish_reason: null }] }); }
+                    } else { console.error(`Fal result fetch error: ${resultRes.status} ${await resultRes.text()}`); /* Potentially send error chunk */ }
                   }
-                } else { console.warn(`Fal status check error: ${statusRes.status} ${await statusRes.text()}`); }
-              } catch (e) { console.error(`Polling exception: ${e}`); }
+                } else { console.warn(`Fal status check error: ${statusRes.status} ${await statusRes.text()}`); /* Potentially send error chunk */ }
+              } catch (e) { console.error(`Polling exception: ${e.toString()}`); /* Potentially send error chunk */ }
               if (!artifactGenerated) { await new Promise(r => setTimeout(r, pollInterval)); attempt++; }
             }
-            if (!artifactGenerated) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { content: isVideoModel ? "视频生成超时。" : "图像生成超时。" }, finish_reason: null }] });
-            send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+            if (!artifactGenerated) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "视频生成超时，请稍后再试或调整参数。" : "图像生成超时，请稍后再试或调整参数。" }, finish_reason: null }] });
+            send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             controller.close();
           }
@@ -358,19 +370,16 @@ export default {
       // Non-streaming polling
       let attempt = 0;
       while (attempt < maxAttempts) {
-        // ... (Non-streaming polling logic similar to streaming, but constructs a single final response)
-        // This part is kept brief as streaming is often preferred. The logic would mirror the streaming poll.
-        await new Promise(r => setTimeout(r, pollInterval)); attempt++;
-        // Simplified for brevity: assume it populates generatedArtifactUrls or fails.
-        // In a full implementation, this loop would be similar to the stream's polling loop.
+        await new Promise(r => setTimeout(r, pollInterval)); 
+        attempt++;
          try {
             const statusUrl = `${falStatusBaseUrl}/requests/${requestId}/status`;
             const resultUrl = `${falStatusBaseUrl}/requests/${requestId}`;
             const statusRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } });
             if (statusRes.status === 200) {
                 const statusData = await statusRes.json();
-                if (statusData.status === "FAILED") {
-                    const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || "Generation failed at Fal API.";
+                 if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
+                    const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
                     return new Response(JSON.stringify({ error: { message: errorMsg, type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
                 }
@@ -381,20 +390,20 @@ export default {
                          if (isVideoModel) {
                             if (resultData.video && resultData.video.url) generatedArtifactUrls.push(resultData.video.url);
                         } else {
-                            if (resultData.images && resultData.images.length > 0) resultData.images.forEach(img => img.url && generatedArtifactUrls.push(img.url));
+                            if (resultData.images && Array.isArray(resultData.images) && resultData.images.length > 0) resultData.images.forEach(img => img && img.url && generatedArtifactUrls.push(img.url));
                             else if (resultData.image && resultData.image.url) generatedArtifactUrls.push(resultData.image.url);
                         }
-                        if (generatedArtifactUrls.length > 0) break; // Found results
+                        if (generatedArtifactUrls.length > 0) break; 
                     }
                 }
             }
-        } catch (e) { console.error(`Non-stream polling exception: ${e}`); }
+        } catch (e) { console.error(`Non-stream polling exception: ${e.toString()}`); }
       }
 
 
       if (generatedArtifactUrls.length === 0) {
-        return new Response(JSON.stringify({ id: `chatcmpl-${requestId}`, object: "chat.completion", created: Math.floor(Date.now()/1000), model,
-          choices: [{ index: 0, message: { role: "assistant", content: isVideoModel ? "无法生成视频，请重试。" : "无法生成图像，请重试。" }, finish_reason: "stop" }],
+        return new Response(JSON.stringify({ id: `chatcmpl-${requestId}`, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelIdToUse,
+          choices: [{ index: 0, message: { role: "assistant", content: isVideoModel ? "无法生成视频或超时，请重试。" : "无法生成图像或超时，请重试。" }, finish_reason: "stop" }],
           usage: { prompt_tokens: Math.floor(prompt.length/4), completion_tokens: 20, total_tokens: Math.floor(prompt.length/4) + 20 }
         }), { headers: { 'Content-Type': 'application/json' } });
       }
@@ -405,20 +414,20 @@ export default {
         content += isVideoModel ? `视频链接: ${url}` : `![Generated ${i+1}](${url})`;
       });
       
-      return new Response(JSON.stringify({ id: `chatcmpl-${requestId}`, object: "chat.completion", created: Math.floor(Date.now()/1000), model,
+      return new Response(JSON.stringify({ id: `chatcmpl-${requestId}`, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelIdToUse,
         choices: [{ index: 0, message: { role: "assistant", content: content }, finish_reason: "stop" }],
         usage: { prompt_tokens: Math.floor(prompt.length/4), completion_tokens: Math.floor(content.length/4), total_tokens: Math.floor(prompt.length/4) + Math.floor(content.length/4) }
       }), { headers: { 'Content-Type': 'application/json' } });
 
     } catch (e) {
-      console.error(`Overall exception: ${e}`, e.stack);
+      console.error(`Overall exception in handleChatCompletions: ${e.toString()}`, e.stack);
       return new Response(JSON.stringify({ error: { message: `Server error: ${e.toString()}`, type: "server_error" } }),
                          { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
   }
 
   function createStreamingDefaultResponse(model, message) {
-    const requestId = Date.now().toString(36);
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
     const stream = new ReadableStream({
       start(controller) {
         const encoder = new TextEncoder();
@@ -433,7 +442,7 @@ export default {
     return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } });
   }
 
-  async function handleImageGenerations(request, env) {
+  async function handleImageGenerations(request) {
     const authResult = extractAndValidateApiKey(request);
     if (!authResult.valid) {
       return new Response(JSON.stringify({ error: { message: authResult.error || "Invalid API key.", type: "authentication_error" } }),
@@ -442,35 +451,55 @@ export default {
 
     let openaiRequest;
     try { openaiRequest = await request.json(); }
-    catch (e) { return new Response(JSON.stringify({ error: { message: "Invalid JSON in request body", type: "invalid_request_error" } }),
+    catch (e) { return new Response(JSON.stringify({ error: { message: "Invalid JSON in request body for image generation", type: "invalid_request_error" } }),
         { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
 
     const prompt = openaiRequest.prompt || '';
-    const model = openaiRequest.model || 'dall-e-3';
+    const model = openaiRequest.model || 'dall-e-3'; // Default if not specified
     const stream = openaiRequest.stream === true;
-    const imageUrl = openaiRequest.image_url || null; // Fal-specific for image-to-image in this endpoint
+    // For /v1/images/generations, Fal's image-to-image might expect image_url directly in the payload if this route is kept Fal-specific.
+    // However, to unify, we'll convert it to the chat completions format.
+    const imageUrl = openaiRequest.image_url || null; 
 
     const messages = [];
-    let userContent = [{ type: "text", text: prompt }];
+    let userContent = [];
+    if (prompt) userContent.push({ type: "text", text: prompt });
     if (imageUrl) userContent.push({ type: "image_url", image_url: { url: imageUrl } });
+    
+    if (userContent.length === 0) {
+         return new Response(JSON.stringify({ error: { message: "Prompt or image_url is required for image generation.", type: "invalid_request_error" } }),
+            { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
     messages.push({ role: "user", content: userContent });
 
-    const chatPayload = { model, messages, stream, n: openaiRequest.n }; // Pass 'n' if present
+    const chatPayload = { model, messages, stream, n: openaiRequest.n }; 
     
     const clonedHeaders = new Headers(request.headers);
-    if (!clonedHeaders.has('Authorization')) clonedHeaders.set('Authorization', `Key ${authResult.userKey}`);
+    // Ensure Authorization is passed correctly; extractAndValidateApiKey already did its job for this request.
+    // For the sub-request to handleChatCompletions, it will re-validate using the same CUSTOM_ACCESS_KEY.
+    if (!clonedHeaders.has('Authorization')) {
+        // This is important: the sub-request to handleChatCompletions needs the original user's key
+        clonedHeaders.set('Authorization', `Key ${authResult.userKey}`);
+    }
+    
+    // Construct a new Request object to call handleChatCompletions internally
+    const chatRequestUrl = new URL(request.url);
+    chatRequestUrl.pathname = '/v1/chat/completions'; // Change path to the chat completions endpoint
 
-    const chatRequest = new Request(new URL(request.url).origin + '/v1/chat/completions', {
+    const chatRequest = new Request(chatRequestUrl.toString(), {
         method: 'POST', headers: clonedHeaders, body: JSON.stringify(chatPayload)
     });
-    return handleChatCompletions(chatRequest, env);
+    return handleChatCompletions(chatRequest); // Call the chat completions handler
   }
 
   async function listModels() {
     const modelsData = Object.keys(MODEL_URLS).map(id => ({
-        id: id, object: "model", created: Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 3600 * 24 * 30), // random creation time
-        owned_by: "fal-openai-adapter", permission: [], root: id.split('-')[0], parent: null
+        id: id, object: "model", created: Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 3600 * 24 * 7), 
+        owned_by: "fal-openai-adapter", // Or your specific identifier
+        permission: [], 
+        root: id.split('-')[0], // Basic root model name
+        parent: null
     }));
     return new Response(JSON.stringify({ object: "list", data: modelsData }),
       { headers: { 'Content-Type': 'application/json' } });
