@@ -1,5 +1,6 @@
-// Read FAL_API_KEYS (comma-separated) from environment variable 
-// v1
+// deno_i2v_proxy v2
+// v1 (no change here, environment variable loading)
+// v2 处理Fal.ai状态轮询中的 202 Accepted HTTP状态码;调整视频生成的轮询超时参数
 const falApiKeysEnv = Deno.env.get("FAL_API_KEYS");
 let AI_KEYS = [];
 if (falApiKeysEnv) {
@@ -13,7 +14,6 @@ if (falApiKeysEnv) {
     console.warn("FAL_API_KEYS environment variable not set. AI functionality will be severely limited or fail. Please set it in your Deno Deploy project settings.");
 }
 
-// Read CUSTOM_ACCESS_KEY from environment variable
 const customAccessKeyEnv = Deno.env.get("MY_CUSTOM_ACCESS_KEY");
 let CUSTOM_ACCESS_KEY = "";
 if (customAccessKeyEnv) {
@@ -25,7 +25,7 @@ if (customAccessKeyEnv) {
 
 
 export default {
-    async fetch(request, env) { // env is part of Cloudflare Workers signature, not directly used here but common pattern
+    async fetch(request, env) {
       const url = new URL(request.url);
       const path = url.pathname;
       if (path === '/v1/chat/completions' && request.method === 'POST') {
@@ -42,7 +42,6 @@ export default {
     }
   };
 
-  // MODEL_URLS remains the same as your previous version
   const MODEL_URLS = {
     "FLUX-pro": {
       "submit_url": "https://queue.fal.run/fal-ai/flux-pro/v1.1-ultra",
@@ -64,8 +63,8 @@ export default {
       "status_base_url": "https://queue.fal.run/fal-ai/ideogram",
       "image-to-image": false, "multi-image-input":false
     },
-    "dall-e-3": { // This seems to be a placeholder or an alias in your original config
-      "submit_url": "https://queue.fal.run/fal-ai/flux/dev", // Example, ensure this is correct if used
+    "dall-e-3": {
+      "submit_url": "https://queue.fal.run/fal-ai/flux/dev",
       "status_base_url": "https://queue.fal.run/fal-ai/flux",
       "image-to-image": false, "multi-image-input":false
     },
@@ -130,7 +129,6 @@ export default {
     if (!randomApiKey) {
         return { valid: false, userKey, error: "Server configuration error: No Fal.ai API keys available. Please check the FAL_API_KEYS environment variable on the server." };
     }
-    // console.log(`Selected random Fal API key: ${randomApiKey.substring(0, 3)}...`);
     return { valid: true, userKey, apiKey: randomApiKey };
   }
 
@@ -143,14 +141,12 @@ export default {
         cleaned_prompt: promptText
     };
     let tempPrompt = ` ${promptText} `;
-
     const patterns = {
         duration: /(?:\s)(?:duration|dur):\s*("?(5|10)"?)(?=\s)/i,
         aspect_ratio: /(?:\s)(?:aspect_ratio|ar):\s*("?(16:9|9:16|1:1)"?)(?=\s)/i,
         negative_prompt: /(?:\s)(?:negative_prompt|np):\s*("(.*?)"|([^"\s]+(?:\s+[^"\s]+)*))(?=\s(?:duration:|dur:|aspect_ratio:|ar:|cfg_scale:|cfg:|$))/i,
         cfg_scale: /(?:\s)(?:cfg_scale|cfg):\s*(\d*\.?\d+)(?=\s)/i
     };
-
     let match;
     match = tempPrompt.match(patterns.duration);
     if (match) { params.duration = match[2]; tempPrompt = tempPrompt.replace(match[0], " "); }
@@ -160,7 +156,6 @@ export default {
     if (match) { params.negative_prompt = (match[2] || match[3]).replace(/"/g, '').trim(); tempPrompt = tempPrompt.replace(match[0], " ");}
     match = tempPrompt.match(patterns.cfg_scale);
     if (match) { const cfgVal = parseFloat(match[1]); if (!isNaN(cfgVal)) { params.cfg_scale = cfgVal; tempPrompt = tempPrompt.replace(match[0], " "); }}
-    
     params.cleaned_prompt = tempPrompt.replace(/\s\s+/g, ' ').trim();
     return params;
   }
@@ -180,11 +175,10 @@ export default {
     }
 
     const messages = openaiRequest.messages || [];
-    const model = openaiRequest.model || 'dall-e-3'; // Default model if not specified
+    const model = openaiRequest.model || 'dall-e-3';
     const stream = openaiRequest.stream === true;
-    // console.log(`ChatCompletions: Model: ${model}, Stream: ${stream}`);
 
-    const modelIdToUse = MODEL_URLS[model] ? model : "dall-e-3"; // Fallback to a default if model key doesn't exist
+    const modelIdToUse = MODEL_URLS[model] ? model : "dall-e-3";
     const modelConfig = MODEL_URLS[modelIdToUse];
     if (!modelConfig) {
         console.error(`Model configuration for "${modelIdToUse}" not found.`);
@@ -221,7 +215,7 @@ export default {
             const imageMatches = assistantContent.match(/!\[.*?\]\((https?:\/\/[^\)]+)\)/g);
             if (imageMatches && imageMatches.length > 0) {
               const urlMatch = imageMatches[imageMatches.length - 1].match(/!\[.*?\]\((https?:\/\/[^\)]+)\)/);
-              if (urlMatch && urlMatch[1]) { imageUrl = urlMatch[1]; /* console.log(`Using image from history: ${imageUrl.substring(0,50)}...`); */ break; }
+              if (urlMatch && urlMatch[1]) { imageUrl = urlMatch[1]; break; }
             }
           }
         }
@@ -238,7 +232,6 @@ export default {
         }
         klingParams = parseKlingParamsFromPrompt(prompt);
         actualPromptForFal = klingParams.cleaned_prompt;
-        // console.log("Kling Params Parsed:", klingParams);
         if (!actualPromptForFal) {
              return new Response(JSON.stringify({ error: { message: "Video generation requires a descriptive prompt for the video content, even when using parameters. The descriptive part of your prompt is empty.", type: "invalid_request_error" } }),
                 { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -248,7 +241,6 @@ export default {
     if (!actualPromptForFal && !isVideoModel && !modelConfig["image-to-image"]) {
         return createStreamingDefaultResponse(model, "Please describe the image you want to generate.");
     }
-    // console.log(`Effective prompt for Fal API: ${actualPromptForFal}`);
 
     const falRequest = {};
     if (isVideoModel && klingParams) {
@@ -276,7 +268,6 @@ export default {
         }
     }
 
-    // console.log("Making request to Fal API:", JSON.stringify(falRequest));
     const falSubmitUrl = modelConfig.submit_url;
     const falStatusBaseUrl = modelConfig.status_base_url;
 
@@ -285,7 +276,6 @@ export default {
       const falResponse = await fetch(falSubmitUrl, { method: 'POST', headers: headers, body: JSON.stringify(falRequest) });
       
       const responseText = await falResponse.text();
-      // Fal can return 202 for queued requests which is also a success for submission
       if (falResponse.status !== 200 && falResponse.status !== 202) {
         console.error(`Fal API Error (${falSubmitUrl}): ${falResponse.status} - ${responseText.substring(0,500)}`);
         return new Response(JSON.stringify({ error: { message: `Fal API submission error (status ${falResponse.status}): ${responseText}`, type: "fal_api_error", code: falResponse.status } }),
@@ -293,18 +283,18 @@ export default {
       }
 
       const falData = JSON.parse(responseText);
-      // Fal might return request_id directly, or nested under a "request" object for some endpoints
       const requestId = falData.request_id || (falData.request && falData.request.id);
       if (!requestId) {
         console.error("No request_id in Fal response:", falData);
         return new Response(JSON.stringify({ error: { message: "Missing request_id from Fal API after submission.", type: "fal_api_error" } }),
                            { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
-      // console.log(`Got request_id: ${requestId}`);
       
       let generatedArtifactUrls = [];
-      const maxAttempts = isVideoModel ? 70 : 45; // Increased attempts for video
-      const pollInterval = isVideoModel ? 4000 : 2500; // Increased interval for video
+      // MODIFICATION START: Adjusted maxAttempts for video models
+      const maxAttempts = isVideoModel ? 150 : 45; // Increased for video (150 * 4s = 600s = 10 minutes)
+      // MODIFICATION END: Adjusted maxAttempts for video models
+      const pollInterval = isVideoModel ? 4000 : 2500;
 
       if (stream) {
         const readableStream = new ReadableStream({
@@ -320,14 +310,17 @@ export default {
                 const statusUrl = `${falStatusBaseUrl}/requests/${requestId}/status`;
                 const resultUrl = `${falStatusBaseUrl}/requests/${requestId}`;
                 
-                if (attempt > 0 && attempt % (isVideoModel ? 2 : 4) === 0) { // Progress update more frequently for video
+                if (attempt > 0 && attempt % (isVideoModel ? 2 : 4) === 0) {
                      send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "视频仍在努力处理中..." : "图像仍在努力生成中..." }, finish_reason: null }] });
                 }
 
                 const statusRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } });
-                if (statusRes.status === 200) {
+                
+                // MODIFICATION START: Handle 202 Accepted for IN_PROGRESS/IN_QUEUE status from Fal.ai
+                if (statusRes.status === 200 || statusRes.status === 202) {
                   const statusData = await statusRes.json();
-                  // console.log(`Poll ${attempt+1}: status ${statusData.status}, progress ${statusData.progress || 'N/A'}`);
+                  // console.log(`Stream Poll ${attempt+1}: status ${statusData.status}, progress ${statusData.progress || 'N/A'}, HTTP Status: ${statusRes.status}`); // Verbose logging
+
                   if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
                     const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
                     send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `生成失败: ${errorMsg}` }, finish_reason: null }] });
@@ -339,9 +332,9 @@ export default {
                       const resultData = await resultRes.json();
                       if (isVideoModel) {
                         if (resultData.video && resultData.video.url) generatedArtifactUrls.push(resultData.video.url);
-                      } else { // Image models
+                      } else {
                         if (resultData.images && Array.isArray(resultData.images) && resultData.images.length > 0) resultData.images.forEach(img => img && img.url && generatedArtifactUrls.push(img.url));
-                        else if (resultData.image && resultData.image.url) generatedArtifactUrls.push(resultData.image.url); // some models might return a single image object
+                        else if (resultData.image && resultData.image.url) generatedArtifactUrls.push(resultData.image.url);
                       }
 
                       if (generatedArtifactUrls.length > 0) {
@@ -352,11 +345,30 @@ export default {
                           if (i > 0) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: "\n\n" }, finish_reason: null }] });
                           send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? `视频链接: ${url}` : `![Generated ${i+1}](${url})` }, finish_reason: null }] });
                         });
-                      } else { artifactGenerated = true; send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: "生成任务已完成，但未能从Fal API获取有效的输出URL。" }, finish_reason: null }] }); }
-                    } else { console.error(`Fal result fetch error: ${resultRes.status} ${await resultRes.text()}`); /* Potentially send error chunk */ }
+                      } else { 
+                        artifactGenerated = true; 
+                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: "生成任务已完成，但未能从Fal API获取有效的输出URL。" }, finish_reason: null }] }); 
+                      }
+                    } else { 
+                        console.error(`Stream: Fal result fetch error: ${resultRes.status} ${await resultRes.text()}`); 
+                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `获取结果失败 (HTTP ${resultRes.status})。` }, finish_reason: null }] });
+                        artifactGenerated = true; // Stop polling on result fetch error
+                    }
                   }
-                } else { console.warn(`Fal status check error: ${statusRes.status} ${await statusRes.text()}`); /* Potentially send error chunk */ }
-              } catch (e) { console.error(`Polling exception: ${e.toString()}`); /* Potentially send error chunk */ }
+                  // If status is IN_PROGRESS or IN_QUEUE, artifactGenerated remains false, loop continues.
+                } else {
+                  // Handle other non-200/202 HTTP errors during status check
+                  const errorText = await statusRes.text();
+                  console.error(`Stream: Fal status check serious error: ${statusRes.status} - ${errorText}`);
+                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,100)}` }, finish_reason: null }] });
+                  artifactGenerated = true; // Stop polling on serious status check errors
+                }
+                // MODIFICATION END: Handle 202 Accepted for IN_PROGRESS/IN_QUEUE status from Fal.ai
+              } catch (e) { 
+                  console.error(`Stream: Polling exception: ${e.toString()}`); 
+                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `轮询过程中发生错误: ${e.toString().substring(0,100)}` }, finish_reason: null }] });
+                  artifactGenerated = true; // Stop polling on exception
+              }
               if (!artifactGenerated) { await new Promise(r => setTimeout(r, pollInterval)); attempt++; }
             }
             if (!artifactGenerated) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "视频生成超时，请稍后再试或调整参数。" : "图像生成超时，请稍后再试或调整参数。" }, finish_reason: null }] });
@@ -370,15 +382,20 @@ export default {
 
       // Non-streaming polling
       let attempt = 0;
-      while (attempt < maxAttempts) {
+      let artifactGeneratedNonStream = false; // Separate flag for non-streaming
+      while (attempt < maxAttempts && !artifactGeneratedNonStream) {
         await new Promise(r => setTimeout(r, pollInterval)); 
         attempt++;
          try {
             const statusUrl = `${falStatusBaseUrl}/requests/${requestId}/status`;
             const resultUrl = `${falStatusBaseUrl}/requests/${requestId}`;
             const statusRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } });
-            if (statusRes.status === 200) {
+
+            // MODIFICATION START: Handle 202 Accepted for IN_PROGRESS/IN_QUEUE status from Fal.ai (Non-stream)
+            if (statusRes.status === 200 || statusRes.status === 202) {
                 const statusData = await statusRes.json();
+                // console.log(`Non-Stream Poll ${attempt+1}: status ${statusData.status}, HTTP Status: ${statusRes.status}`); // Verbose logging
+
                  if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
                     const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
                     return new Response(JSON.stringify({ error: { message: errorMsg, type: "generation_failed" } }),
@@ -394,15 +411,39 @@ export default {
                             if (resultData.images && Array.isArray(resultData.images) && resultData.images.length > 0) resultData.images.forEach(img => img && img.url && generatedArtifactUrls.push(img.url));
                             else if (resultData.image && resultData.image.url) generatedArtifactUrls.push(resultData.image.url);
                         }
-                        if (generatedArtifactUrls.length > 0) break; 
+                        if (generatedArtifactUrls.length > 0) {
+                            artifactGeneratedNonStream = true; // Set flag to exit loop
+                        } else {
+                            // Completed but no URLs, treat as error for non-stream
+                             return new Response(JSON.stringify({ error: { message: "生成任务已完成，但未能从Fal API获取有效的输出URL。", type: "generation_failed" } }),
+                                       { status: 500, headers: { 'Content-Type': 'application/json' } });
+                        }
+                    } else {
+                        // Error fetching result
+                        const errorText = await resultRes.text();
+                        console.error(`Non-Stream: Fal result fetch error: ${resultRes.status} - ${errorText}`);
+                        return new Response(JSON.stringify({ error: { message: `获取结果失败 (HTTP ${resultRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
+                                       { status: 500, headers: { 'Content-Type': 'application/json' } });
                     }
                 }
+                // If IN_PROGRESS or IN_QUEUE, continue loop
+            } else {
+                 // Handle other non-200/202 HTTP errors during status check
+                const errorText = await statusRes.text();
+                console.error(`Non-Stream: Fal status check serious error: ${statusRes.status} - ${errorText}`);
+                return new Response(JSON.stringify({ error: { message: `检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
+                                       { status: 500, headers: { 'Content-Type': 'application/json' } });
             }
-        } catch (e) { console.error(`Non-stream polling exception: ${e.toString()}`); }
+            // MODIFICATION END: Handle 202 Accepted for IN_PROGRESS/IN_QUEUE status from Fal.ai (Non-stream)
+        } catch (e) { 
+            console.error(`Non-stream polling exception: ${e.toString()}`);
+            return new Response(JSON.stringify({ error: { message: `轮询过程中发生错误: ${e.toString()}`, type: "server_error" } }),
+                                       { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
       }
 
 
-      if (generatedArtifactUrls.length === 0) {
+      if (generatedArtifactUrls.length === 0) { // This implies timeout if artifactGeneratedNonStream is still false
         return new Response(JSON.stringify({ id: `chatcmpl-${requestId}`, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelIdToUse,
           choices: [{ index: 0, message: { role: "assistant", content: isVideoModel ? "无法生成视频或超时，请重试。" : "无法生成图像或超时，请重试。" }, finish_reason: "stop" }],
           usage: { prompt_tokens: Math.floor(prompt.length/4), completion_tokens: 20, total_tokens: Math.floor(prompt.length/4) + 20 }
@@ -457,10 +498,8 @@ export default {
     }
 
     const prompt = openaiRequest.prompt || '';
-    const model = openaiRequest.model || 'dall-e-3'; // Default if not specified
+    const model = openaiRequest.model || 'dall-e-3';
     const stream = openaiRequest.stream === true;
-    // For /v1/images/generations, Fal's image-to-image might expect image_url directly in the payload if this route is kept Fal-specific.
-    // However, to unify, we'll convert it to the chat completions format.
     const imageUrl = openaiRequest.image_url || null; 
 
     const messages = [];
@@ -477,29 +516,25 @@ export default {
     const chatPayload = { model, messages, stream, n: openaiRequest.n }; 
     
     const clonedHeaders = new Headers(request.headers);
-    // Ensure Authorization is passed correctly; extractAndValidateApiKey already did its job for this request.
-    // For the sub-request to handleChatCompletions, it will re-validate using the same CUSTOM_ACCESS_KEY.
     if (!clonedHeaders.has('Authorization')) {
-        // This is important: the sub-request to handleChatCompletions needs the original user's key
         clonedHeaders.set('Authorization', `Key ${authResult.userKey}`);
     }
     
-    // Construct a new Request object to call handleChatCompletions internally
     const chatRequestUrl = new URL(request.url);
-    chatRequestUrl.pathname = '/v1/chat/completions'; // Change path to the chat completions endpoint
+    chatRequestUrl.pathname = '/v1/chat/completions';
 
     const chatRequest = new Request(chatRequestUrl.toString(), {
         method: 'POST', headers: clonedHeaders, body: JSON.stringify(chatPayload)
     });
-    return handleChatCompletions(chatRequest); // Call the chat completions handler
+    return handleChatCompletions(chatRequest);
   }
 
   async function listModels() {
     const modelsData = Object.keys(MODEL_URLS).map(id => ({
         id: id, object: "model", created: Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 3600 * 24 * 7), 
-        owned_by: "fal-openai-adapter", // Or your specific identifier
+        owned_by: "fal-openai-adapter",
         permission: [], 
-        root: id.split('-')[0], // Basic root model name
+        root: id.split('-')[0],
         parent: null
     }));
     return new Response(JSON.stringify({ object: "list", data: modelsData }),
