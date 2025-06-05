@@ -1,6 +1,20 @@
-// deno_i2v_proxy v2
-// v1 (no change here, environment variable loading)
-// v2 处理Fal.ai状态轮询中的 202 Accepted HTTP状态码;调整视频生成的轮询超时参数
+// deno_i2v_proxy v3
+
+// deno_i2v_proxy v3 主要修改内容：
+// 1. 处理Fal.ai提交请求时HTTP 413 Payload Too Large错误：
+//    - 当客户端上传的图片过大（导致发送给Fal.ai的请求体超过4MB限制）时，脚本现在会捕获此413错误。
+//    - 并向客户端（例如Cherry Studio）返回一个清晰的错误提示，告知图片文件过大。
+// 2. 增强流式响应中控制器操作的健壮性：
+//    - 在流式响应的 `controller.enqueue()` 和 `controller.close()` 操作周围添加了 `try...catch` 块。
+//    - 目的是捕获当客户端（例如Cherry Studio）可能提前断开连接后，再对流控制器进行操作时可能抛出的
+//      `TypeError: The stream controller cannot close or enqueue` 错误。
+//    - 这可以防止Deno脚本因客户端的意外断开而记录未捕获的异常，并尝试更优雅地处理这种情况。
+// 3. 轮询超时参数调整：(此项已在v2中修改，v3保留)
+//    - `maxAttempts` for video models 保持为 `150` (配合4秒的轮询间隔，提供约10分钟的轮询时间)。
+// 4. Fal.ai状态轮询中HTTP 202 Accepted状态码处理：(此项已在v2中修改，v3保留)
+//    - 脚本会正确处理Fal.ai在任务进行中（`IN_PROGRESS` 或 `IN_QUEUE`）时返回的 `202 Accepted` HTTP状态码。
+
+
 const falApiKeysEnv = Deno.env.get("FAL_API_KEYS");
 let AI_KEYS = [];
 if (falApiKeysEnv) {
@@ -227,25 +241,25 @@ export default {
 
     if (isVideoModel) {
         if (!imageUrl) {
-            return new Response(JSON.stringify({ error: { message: "Video generation with this model requires an image. Please upload an image.", type: "invalid_request_error" } }),
+            return new Response(JSON.stringify({ error: { message: "视频生成需要图片，请上传图片。", type: "invalid_request_error" } }),
                 { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
         klingParams = parseKlingParamsFromPrompt(prompt);
         actualPromptForFal = klingParams.cleaned_prompt;
         if (!actualPromptForFal) {
-             return new Response(JSON.stringify({ error: { message: "Video generation requires a descriptive prompt for the video content, even when using parameters. The descriptive part of your prompt is empty.", type: "invalid_request_error" } }),
+             return new Response(JSON.stringify({ error: { message: "视频生成需要描述性提示词，即使使用了参数，描述部分不能为空。", type: "invalid_request_error" } }),
                 { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
     }
 
     if (!actualPromptForFal && !isVideoModel && !modelConfig["image-to-image"]) {
-        return createStreamingDefaultResponse(model, "Please describe the image you want to generate.");
+        return createStreamingDefaultResponse(model, "请描述您想生成的图片。");
     }
 
     const falRequest = {};
     if (isVideoModel && klingParams) {
         falRequest.prompt = actualPromptForFal;
-        falRequest.image_url = imageUrl;
+        falRequest.image_url = imageUrl; // image_url is expected by kling model
         falRequest.duration = klingParams.duration;
         falRequest.aspect_ratio = klingParams.aspect_ratio;
         falRequest.negative_prompt = klingParams.negative_prompt;
@@ -262,7 +276,7 @@ export default {
                 else if (imageUrls.length > 0) falRequest.image_url = imageUrls[0];
             }
             if (!falRequest.image_url && (!falRequest.image_urls || falRequest.image_urls.length === 0)) {
-                 return new Response(JSON.stringify({ error: { message: "This model requires an image for editing/generation. None found in current message or history.", type: "invalid_request_error" } }),
+                 return new Response(JSON.stringify({ error: { message: "此模型需要图片进行编辑/生成，当前消息或历史记录中未找到图片。", type: "invalid_request_error" } }),
                     { status: 400, headers: { 'Content-Type': 'application/json' } });
             }
         }
@@ -275,37 +289,81 @@ export default {
       const headers = { "Authorization": `Key ${apiKey}`, "Content-Type": "application/json" };
       const falResponse = await fetch(falSubmitUrl, { method: 'POST', headers: headers, body: JSON.stringify(falRequest) });
       
+      // MODIFICATION START: Handle 413 Payload Too Large from Fal.ai
+      if (falResponse.status === 413) {
+          console.error(`Fal API Error (${falSubmitUrl}): 413 - Payload Too Large. Image likely too big.`);
+          const errorMsg413 = "错误：上传的图片文件过大，超过了4MB的限制。请尝试使用更小的图片。";
+          if (stream) {
+              const readableStream = new ReadableStream({
+                  start(controller) {
+                      const encoder = new TextEncoder();
+                      const send = (data) => { try { if (controller.desiredSize !== null) controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`)); } catch(e){ console.warn("Stream controller closed (413 error path):", e.message);}};
+                      send({ id: `chatcmpl-${Date.now().toString(36)}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+                      send({ id: `chatcmpl-${Date.now().toString(36)}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: errorMsg413 }, finish_reason: null }] });
+                      send({ id: `chatcmpl-${Date.now().toString(36)}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+                      try { if (controller.desiredSize !== null) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); }} catch(e){ console.warn("Stream controller closed (413 error path close):", e.message);};
+                  }
+              });
+              return new Response(readableStream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } });
+          } else {
+              return new Response(JSON.stringify({ error: { message: errorMsg413, type: "invalid_request_error", code: 413 } }),
+                                 { status: 413, headers: { 'Content-Type': 'application/json' } });
+          }
+      }
+      // MODIFICATION END: Handle 413 Payload Too Large from Fal.ai
+
       const responseText = await falResponse.text();
       if (falResponse.status !== 200 && falResponse.status !== 202) {
         console.error(`Fal API Error (${falSubmitUrl}): ${falResponse.status} - ${responseText.substring(0,500)}`);
-        return new Response(JSON.stringify({ error: { message: `Fal API submission error (status ${falResponse.status}): ${responseText}`, type: "fal_api_error", code: falResponse.status } }),
+        return new Response(JSON.stringify({ error: { message: `Fal API 提交错误 (状态 ${falResponse.status}): ${responseText}`, type: "fal_api_error", code: falResponse.status } }),
                            { status: falResponse.status > 0 ? falResponse.status : 500 , headers: { 'Content-Type': 'application/json' } });
       }
 
       const falData = JSON.parse(responseText);
       const requestId = falData.request_id || (falData.request && falData.request.id);
       if (!requestId) {
-        console.error("No request_id in Fal response:", falData);
-        return new Response(JSON.stringify({ error: { message: "Missing request_id from Fal API after submission.", type: "fal_api_error" } }),
+        console.error("Fal 响应中没有 request_id:", falData);
+        return new Response(JSON.stringify({ error: { message: "Fal API 提交后缺少 request_id。", type: "fal_api_error" } }),
                            { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
       
       let generatedArtifactUrls = [];
-      // MODIFICATION START: Adjusted maxAttempts for video models
-      const maxAttempts = isVideoModel ? 150 : 45; // Increased for video (150 * 4s = 600s = 10 minutes)
-      // MODIFICATION END: Adjusted maxAttempts for video models
+      const maxAttempts = isVideoModel ? 150 : 45; 
       const pollInterval = isVideoModel ? 4000 : 2500;
 
       if (stream) {
         const readableStream = new ReadableStream({
           async start(controller) {
             const encoder = new TextEncoder();
-            const send = (data) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+            let streamClosedByError = false; // Flag to prevent further enqueues if controller is bad
+
+            const send = (data) => {
+                if (streamClosedByError) return;
+                try {
+                    // Check if the stream is still active before trying to enqueue
+                    // desiredSize being null means the stream is closing or closed
+                    if (controller.desiredSize === null) {
+                        console.warn("Stream controller is already closing/closed, cannot enqueue data:", data);
+                        streamClosedByError = true; // Prevent further attempts
+                        return;
+                    }
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+                } catch (e) {
+                    if (e.name === 'TypeError' && (e.message.includes('cannot close or enqueue') || e.message.includes('is closing'))) {
+                        console.warn("Stream controller was already closed or in a bad state when trying to enqueue. Client likely disconnected.", e.message);
+                        streamClosedByError = true; // Prevent further attempts
+                    } else {
+                        console.error("Error enqueuing data to stream:", e);
+                        streamClosedByError = true; // Prevent further attempts on other errors too
+                    }
+                }
+            };
+            
             send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
 
             let attempt = 0;
             let artifactGenerated = false;
-            while (attempt < maxAttempts && !artifactGenerated) {
+            while (attempt < maxAttempts && !artifactGenerated && !streamClosedByError) {
               try {
                 const statusUrl = `${falStatusBaseUrl}/requests/${requestId}/status`;
                 const resultUrl = `${falStatusBaseUrl}/requests/${requestId}`;
@@ -316,10 +374,8 @@ export default {
 
                 const statusRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } });
                 
-                // MODIFICATION START: Handle 202 Accepted for IN_PROGRESS/IN_QUEUE status from Fal.ai
                 if (statusRes.status === 200 || statusRes.status === 202) {
                   const statusData = await statusRes.json();
-                  // console.log(`Stream Poll ${attempt+1}: status ${statusData.status}, progress ${statusData.progress || 'N/A'}, HTTP Status: ${statusRes.status}`); // Verbose logging
 
                   if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
                     const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
@@ -352,29 +408,40 @@ export default {
                     } else { 
                         console.error(`Stream: Fal result fetch error: ${resultRes.status} ${await resultRes.text()}`); 
                         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `获取结果失败 (HTTP ${resultRes.status})。` }, finish_reason: null }] });
-                        artifactGenerated = true; // Stop polling on result fetch error
+                        artifactGenerated = true;
                     }
                   }
-                  // If status is IN_PROGRESS or IN_QUEUE, artifactGenerated remains false, loop continues.
                 } else {
-                  // Handle other non-200/202 HTTP errors during status check
                   const errorText = await statusRes.text();
                   console.error(`Stream: Fal status check serious error: ${statusRes.status} - ${errorText}`);
                   send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,100)}` }, finish_reason: null }] });
-                  artifactGenerated = true; // Stop polling on serious status check errors
+                  artifactGenerated = true;
                 }
-                // MODIFICATION END: Handle 202 Accepted for IN_PROGRESS/IN_QUEUE status from Fal.ai
               } catch (e) { 
                   console.error(`Stream: Polling exception: ${e.toString()}`); 
                   send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `轮询过程中发生错误: ${e.toString().substring(0,100)}` }, finish_reason: null }] });
-                  artifactGenerated = true; // Stop polling on exception
+                  artifactGenerated = true;
               }
-              if (!artifactGenerated) { await new Promise(r => setTimeout(r, pollInterval)); attempt++; }
+              if (!artifactGenerated && !streamClosedByError) { await new Promise(r => setTimeout(r, pollInterval)); attempt++; }
             }
-            if (!artifactGenerated) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "视频生成超时，请稍后再试或调整参数。" : "图像生成超时，请稍后再试或调整参数。" }, finish_reason: null }] });
-            send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-            controller.close();
+
+            if (!artifactGenerated && !streamClosedByError) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "视频生成超时，请稍后再试或调整参数。" : "图像生成超时，请稍后再试或调整参数。" }, finish_reason: null }] });
+            
+            if (!streamClosedByError) {
+                send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+                try {
+                    if (controller.desiredSize !== null) {
+                        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                        controller.close();
+                    }
+                } catch (e) {
+                    if (e.name === 'TypeError' && (e.message.includes('cannot close or enqueue') || e.message.includes('is closing'))) {
+                         console.warn("Stream controller was already closed when trying to send [DONE] or close.", e.message);
+                    } else {
+                         console.error("Error sending [DONE] or closing stream:", e);
+                    }
+                }
+            }
           }
         });
         return new Response(readableStream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } });
@@ -382,7 +449,7 @@ export default {
 
       // Non-streaming polling
       let attempt = 0;
-      let artifactGeneratedNonStream = false; // Separate flag for non-streaming
+      let artifactGeneratedNonStream = false;
       while (attempt < maxAttempts && !artifactGeneratedNonStream) {
         await new Promise(r => setTimeout(r, pollInterval)); 
         attempt++;
@@ -391,11 +458,8 @@ export default {
             const resultUrl = `${falStatusBaseUrl}/requests/${requestId}`;
             const statusRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } });
 
-            // MODIFICATION START: Handle 202 Accepted for IN_PROGRESS/IN_QUEUE status from Fal.ai (Non-stream)
             if (statusRes.status === 200 || statusRes.status === 202) {
                 const statusData = await statusRes.json();
-                // console.log(`Non-Stream Poll ${attempt+1}: status ${statusData.status}, HTTP Status: ${statusRes.status}`); // Verbose logging
-
                  if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
                     const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
                     return new Response(JSON.stringify({ error: { message: errorMsg, type: "generation_failed" } }),
@@ -412,29 +476,24 @@ export default {
                             else if (resultData.image && resultData.image.url) generatedArtifactUrls.push(resultData.image.url);
                         }
                         if (generatedArtifactUrls.length > 0) {
-                            artifactGeneratedNonStream = true; // Set flag to exit loop
+                            artifactGeneratedNonStream = true; 
                         } else {
-                            // Completed but no URLs, treat as error for non-stream
                              return new Response(JSON.stringify({ error: { message: "生成任务已完成，但未能从Fal API获取有效的输出URL。", type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
                         }
                     } else {
-                        // Error fetching result
                         const errorText = await resultRes.text();
                         console.error(`Non-Stream: Fal result fetch error: ${resultRes.status} - ${errorText}`);
                         return new Response(JSON.stringify({ error: { message: `获取结果失败 (HTTP ${resultRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
                     }
                 }
-                // If IN_PROGRESS or IN_QUEUE, continue loop
             } else {
-                 // Handle other non-200/202 HTTP errors during status check
                 const errorText = await statusRes.text();
                 console.error(`Non-Stream: Fal status check serious error: ${statusRes.status} - ${errorText}`);
                 return new Response(JSON.stringify({ error: { message: `检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
             }
-            // MODIFICATION END: Handle 202 Accepted for IN_PROGRESS/IN_QUEUE status from Fal.ai (Non-stream)
         } catch (e) { 
             console.error(`Non-stream polling exception: ${e.toString()}`);
             return new Response(JSON.stringify({ error: { message: `轮询过程中发生错误: ${e.toString()}`, type: "server_error" } }),
@@ -442,8 +501,7 @@ export default {
         }
       }
 
-
-      if (generatedArtifactUrls.length === 0) { // This implies timeout if artifactGeneratedNonStream is still false
+      if (generatedArtifactUrls.length === 0) {
         return new Response(JSON.stringify({ id: `chatcmpl-${requestId}`, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelIdToUse,
           choices: [{ index: 0, message: { role: "assistant", content: isVideoModel ? "无法生成视频或超时，请重试。" : "无法生成图像或超时，请重试。" }, finish_reason: "stop" }],
           usage: { prompt_tokens: Math.floor(prompt.length/4), completion_tokens: 20, total_tokens: Math.floor(prompt.length/4) + 20 }
@@ -463,7 +521,7 @@ export default {
 
     } catch (e) {
       console.error(`Overall exception in handleChatCompletions: ${e.toString()}`, e.stack);
-      return new Response(JSON.stringify({ error: { message: `Server error: ${e.toString()}`, type: "server_error" } }),
+      return new Response(JSON.stringify({ error: { message: `服务器错误: ${e.toString()}`, type: "server_error" } }),
                          { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
   }
@@ -473,12 +531,11 @@ export default {
     const stream = new ReadableStream({
       start(controller) {
         const encoder = new TextEncoder();
-        const send = (data) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        const send = (data) => { try { if (controller.desiredSize !== null) controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`)); } catch(e){ console.warn("Stream controller closed (default response):", e.message);}};
         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { content: message }, finish_reason: null }] });
         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
+        try { if (controller.desiredSize !== null) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); }} catch(e){ console.warn("Stream controller closed (default response close):", e.message);};
       }
     });
     return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } });
@@ -493,7 +550,7 @@ export default {
 
     let openaiRequest;
     try { openaiRequest = await request.json(); }
-    catch (e) { return new Response(JSON.stringify({ error: { message: "Invalid JSON in request body for image generation", type: "invalid_request_error" } }),
+    catch (e) { return new Response(JSON.stringify({ error: { message: "图像生成请求体JSON无效", type: "invalid_request_error" } }),
         { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
 
@@ -508,7 +565,7 @@ export default {
     if (imageUrl) userContent.push({ type: "image_url", image_url: { url: imageUrl } });
     
     if (userContent.length === 0) {
-         return new Response(JSON.stringify({ error: { message: "Prompt or image_url is required for image generation.", type: "invalid_request_error" } }),
+         return new Response(JSON.stringify({ error: { message: "图像生成需要Prompt或image_url。", type: "invalid_request_error" } }),
             { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
     messages.push({ role: "user", content: userContent });
