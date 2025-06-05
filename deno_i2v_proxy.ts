@@ -1,20 +1,20 @@
-// deno_i2v_proxy v4
+// deno_i2v_proxy v5
 
-// deno_i2v_proxy v4 主要修改内容提要：
-// 1. 尝试显示百分比进度：
-//    - 在轮询Fal.ai任务状态时，脚本现在会检查响应中是否包含 `progress` 字段。
-//    - 如果 `progress` 字段存在且为有效数字，脚本会将其转换为百分比，并尝试发送类似 "视频处理中... 进度: XX% ▓▓▓░░░░░░░" 的消息。
-//    - 如果 `progress` 字段不可用，则回退到使用动态表情符号来指示处理中。
-// 2. 优化"处理中"的流式消息：
-//    - 引入一个简单的旋转表情符号（spinner）数组，如 `["⏳", "⚙️", "💡", "🎬"]`，在没有百分比进度时，轮流显示这些表情，给用户一种动态感。
-// 3. 美化最终成功/失败消息：
-//    - 对于视频生成成功的消息，采用用户建议的格式，包含✅和🎥表情符号，以及Markdown格式的视频链接。
-//    - 对于超时或失败的消息，也加入适当的提示性表情符号，如⚠️或❌。
-// 4. 保留v3的健壮性修改：
-//    - 继续处理HTTP 413错误（图片过大）。
-//    - 继续对流控制器的操作进行`try...catch`保护。
-//    - 保留针对视频的较长轮询超时设置。
-//    - 继续正确处理Fal.ai状态轮询中的HTTP 202状态码。
+// deno_i2v_proxy v5 主要修改内容提要：
+// 1. 详细记录Fal.ai状态轮询数据：
+//    - 在流式和非流式轮询逻辑中，每次从Fal.ai的 `/status` 端点获取到响应后，
+//      都会在Deno Deploy日志中打印完整的 `statusData` JSON对象。
+//    - 这能帮助我们确认Fal.ai在任务进行中（`IN_PROGRESS`）时是否返回了 `progress` 字段，
+//      以及其具体值和格式。
+// 2. 增强流操作的日志记录：
+//    - 在 `send()` 函数（用于向客户端发送流数据块）的开始和成功结束时添加了日志。
+//    - 在尝试发送最后的 `[DONE]` 消息和关闭流之前及之后添加了日志。
+//    - 当因为 `streamClosedByError` 标志或 `controller.desiredSize === null` 而跳过发送操作时，也会记录。
+//    - 这些日志能帮助我们追踪流的生命周期，判断是否在发送关键数据（如最终的视频链接）之前流就被意外关闭了。
+// 3. 保留v4的改进：
+//    - 继续使用动态spinner表情作为默认的“处理中”提示。
+//    - 保留美化后的成功/失败消息格式。
+//    - 保留HTTP 413错误处理、流控制器`try...catch`保护、针对视频的较长轮询超时设置以及HTTP 202状态码处理。
 
 
 const falApiKeysEnv = Deno.env.get("FAL_API_KEYS");
@@ -176,7 +176,6 @@ export default {
     return params;
   }
 
-  // MODIFICATION: Helper function to create a simple text-based progress bar
   function createProgressBar(progressPercentage, length = 10) {
       const filledLength = Math.round(length * progressPercentage / 100);
       const emptyLength = length - filledLength;
@@ -327,34 +326,38 @@ export default {
       let generatedArtifactUrls = [];
       const maxAttempts = isVideoModel ? 150 : 45; 
       const pollInterval = isVideoModel ? 4000 : 2500;
-      // MODIFICATION: Spinner for progress messages
       const spinnerFrames = ["⏳", "⚙️", "💡", "🎬"];
       let spinnerIndex = 0;
-
 
       if (stream) {
         const readableStream = new ReadableStream({
           async start(controller) {
             const encoder = new TextEncoder();
             let streamClosedByError = false;
+            console.log(`[Stream ${requestId}] Starting stream for model ${modelIdToUse}`);
 
-            const send = (data) => {
-                if (streamClosedByError) return;
+            const send = (data, type = "data") => { // Added type for logging distinction
+                if (streamClosedByError) {
+                    console.log(`[Stream ${requestId}] Send SKIPPED (${type}, streamClosedByError=true):`, JSON.stringify(data).substring(0,100));
+                    return;
+                }
                 try {
                     if (controller.desiredSize === null) {
-                        console.warn("Stream controller is already closing/closed, cannot enqueue data:", JSON.stringify(data).substring(0,100));
+                        console.warn(`[Stream ${requestId}] Send FAILED (${type}, controller.desiredSize is null):`, JSON.stringify(data).substring(0,100));
                         streamClosedByError = true; return;
                     }
+                    // console.log(`[Stream ${requestId}] Send ATTEMPT (${type}):`, JSON.stringify(data).substring(0,100));
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+                    // console.log(`[Stream ${requestId}] Send SUCCESS (${type}):`, JSON.stringify(data).substring(0,100));
                 } catch (e) {
                     if (e.name === 'TypeError' && (e.message.includes('cannot close or enqueue') || e.message.includes('is closing'))) {
-                        console.warn("Stream controller was already closed or in a bad state when trying to enqueue. Client likely disconnected.", e.message);
-                    } else { console.error("Error enqueuing data to stream:", e); }
+                        console.warn(`[Stream ${requestId}] Send EXCEPTION (${type}, TypeError): Client likely disconnected.`, e.message);
+                    } else { console.error(`[Stream ${requestId}] Send EXCEPTION (${type}):`, e); }
                     streamClosedByError = true;
                 }
             };
             
-            send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+            send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }, "role");
 
             let attempt = 0;
             let artifactGenerated = false;
@@ -363,35 +366,25 @@ export default {
                 const statusUrl = `${falStatusBaseUrl}/requests/${requestId}/status`;
                 const resultUrl = `${falStatusBaseUrl}/requests/${requestId}`;
                 
-                // MODIFICATION: Progress message logic
-                if (attempt > 0) { // Don't send progress on first attempt immediately after role chunk
-                    const statusResForProgress = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } }); // Fetch again for latest progress
-                    let progressMsgContent = `视频仍在努力处理中... ${spinnerFrames[spinnerIndex++ % spinnerFrames.length]}`;
-                    if (statusResForProgress.status === 200 || statusResForProgress.status === 202) {
-                        const currentStatusData = await statusResForProgress.json();
-                        if (typeof currentStatusData.progress === 'number' && currentStatusData.progress >= 0 && currentStatusData.progress <= 1) {
-                            const percentage = currentStatusData.progress * 100;
-                            progressMsgContent = `视频处理中... ${createProgressBar(percentage)}`;
-                        }
-                    }
-                     send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: progressMsgContent }, finish_reason: null }] });
-                }
-
-
+                // Fetch status for progress update or final status
                 const statusRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } });
                 
                 if (statusRes.status === 200 || statusRes.status === 202) {
                   const statusData = await statusRes.json();
+                  // MODIFICATION: Log full statusData for debugging progress field
+                  console.log(`[Stream ${requestId}] Poll ${attempt+1} - Fal Status Data (HTTP ${statusRes.status}):`, JSON.stringify(statusData));
 
                   if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
                     const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
-                    send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 生成失败: ${errorMsg}` }, finish_reason: null }] });
+                    send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 生成失败: ${errorMsg}` }, finish_reason: null }] }, "failed_status");
                     artifactGenerated = true; break;
                   }
                   if (statusData.status === "COMPLETED") {
+                    console.log(`[Stream ${requestId}] Fal task COMPLETED. Fetching result...`);
                     const resultRes = await fetch(resultUrl, { headers: { "Authorization": `Key ${apiKey}` } });
                     if (resultRes.status === 200) {
                       const resultData = await resultRes.json();
+                      console.log(`[Stream ${requestId}] Fal Result Data:`, JSON.stringify(resultData).substring(0, 200) + "...");
                       if (isVideoModel) {
                         if (resultData.video && resultData.video.url) generatedArtifactUrls.push(resultData.video.url);
                       } else {
@@ -401,61 +394,80 @@ export default {
 
                       if (generatedArtifactUrls.length > 0) {
                         artifactGenerated = true;
-                        // MODIFICATION: Enhanced success message
                         let successMsg = isVideoModel ? `✅ 视频生成成功!\n\n` : (modelConfig["image-to-image"] ? `✅ 图像编辑成功!\n\n` : `✅ 图像生成成功!\n\n`);
-                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: successMsg }, finish_reason: null }] });
+                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: successMsg }, finish_reason: null }] }, "success_msg");
                         generatedArtifactUrls.forEach((url, i) => {
-                          if (i > 0) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: "\n\n" }, finish_reason: null }] });
+                          if (i > 0) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: "\n\n" }, finish_reason: null }] }, "separator");
                           const linkContent = isVideoModel ? `🎥 [观看视频](${url})` : `🖼️ [查看图片 ${i+1}](${url})`;
-                          send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: linkContent }, finish_reason: null }] });
+                          send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: linkContent }, finish_reason: null }] }, `artifact_link_${i}`);
                         });
                       } else { 
                         artifactGenerated = true; 
-                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: "⚠️ 生成任务已完成，但未能从Fal API获取有效的输出URL。" }, finish_reason: null }] }); 
+                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: "⚠️ 生成任务已完成，但未能从Fal API获取有效的输出URL。" }, finish_reason: null }] }, "completed_no_url"); 
                       }
                     } else { 
-                        console.error(`Stream: Fal result fetch error: ${resultRes.status} ${await resultRes.text()}`); 
-                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 获取结果失败 (HTTP ${resultRes.status})。` }, finish_reason: null }] });
+                        const resultErrorText = await resultRes.text();
+                        console.error(`[Stream ${requestId}] Fal result fetch error: ${resultRes.status} - ${resultErrorText}`); 
+                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 获取结果失败 (HTTP ${resultRes.status})。` }, finish_reason: null }] }, "result_fetch_error");
                         artifactGenerated = true;
                     }
+                  } else { // IN_PROGRESS or IN_QUEUE
+                     if (attempt > 0) { // Send progress update if not the very first check after role
+                        let progressMsgContent = `视频仍在努力处理中... ${spinnerFrames[spinnerIndex++ % spinnerFrames.length]}`;
+                        if (typeof statusData.progress === 'number' && statusData.progress >= 0 && statusData.progress <= 1) {
+                            const percentage = statusData.progress * 100;
+                            progressMsgContent = `视频处理中... ${createProgressBar(percentage)}`;
+                        }
+                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: progressMsgContent }, finish_reason: null }] }, "progress_update");
+                     }
                   }
-                } else {
+                } else { // statusRes.status not 200 or 202
                   const errorText = await statusRes.text();
-                  console.error(`Stream: Fal status check serious error: ${statusRes.status} - ${errorText}`);
-                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,100)}` }, finish_reason: null }] });
-                  artifactGenerated = true;
+                  console.error(`[Stream ${requestId}] Fal status check serious error: ${statusRes.status} - ${errorText}`);
+                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,100)}` }, finish_reason: null }] }, "status_check_error");
+                  artifactGenerated = true; // Stop polling on serious status check errors
                 }
               } catch (e) { 
-                  console.error(`Stream: Polling exception: ${e.toString()}`); 
-                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 轮询过程中发生错误: ${e.toString().substring(0,100)}` }, finish_reason: null }] });
-                  artifactGenerated = true;
+                  console.error(`[Stream ${requestId}] Polling exception: ${e.toString()}`, e.stack); 
+                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 轮询过程中发生错误: ${e.toString().substring(0,100)}` }, finish_reason: null }] }, "polling_exception");
+                  artifactGenerated = true; // Stop polling on exception
               }
               if (!artifactGenerated && !streamClosedByError) { await new Promise(r => setTimeout(r, pollInterval)); attempt++; }
             }
 
-            if (!artifactGenerated && !streamClosedByError) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "⚠️ 视频生成超时，请稍后再试或调整参数。" : "⚠️ 图像生成超时，请稍后再试或调整参数。" }, finish_reason: null }] });
+            if (!artifactGenerated && !streamClosedByError) {
+                send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "⚠️ 视频生成超时，请稍后再试或调整参数。" : "⚠️ 图像生成超时，请稍后再试或调整参数。" }, finish_reason: null }] }, "timeout");
+            }
             
             if (!streamClosedByError) {
-                send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+                console.log(`[Stream ${requestId}] Attempting to send final chunks and close.`);
+                send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }, "final_delta_stop");
                 try {
                     if (controller.desiredSize !== null) {
+                        console.log(`[Stream ${requestId}] Sending [DONE] and closing controller.`);
                         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                         controller.close();
+                        console.log(`[Stream ${requestId}] Controller sent [DONE] and closed successfully.`);
+                    } else {
+                        console.warn(`[Stream ${requestId}] Controller was already closed before sending [DONE].`);
                     }
                 } catch (e) {
                     if (e.name === 'TypeError' && (e.message.includes('cannot close or enqueue') || e.message.includes('is closing'))) {
-                         console.warn("Stream controller was already closed when trying to send [DONE] or close.", e.message);
+                         console.warn(`[Stream ${requestId}] Controller was already closed when trying to send [DONE] or close (TypeError).`, e.message);
                     } else {
-                         console.error("Error sending [DONE] or closing stream:", e);
+                         console.error(`[Stream ${requestId}] Error sending [DONE] or closing stream:`, e);
                     }
                 }
+            } else {
+                 console.log(`[Stream ${requestId}] Final send and close SKIPPED (streamClosedByError=true).`);
             }
+            console.log(`[Stream ${requestId}] Stream processing finished.`);
           }
         });
         return new Response(readableStream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } });
       }
 
-      // Non-streaming polling
+      // Non-streaming polling (simplified for brevity, focus is on streaming part for Cherry Studio)
       let attempt = 0;
       let artifactGeneratedNonStream = false;
       while (attempt < maxAttempts && !artifactGeneratedNonStream) {
@@ -468,6 +480,9 @@ export default {
 
             if (statusRes.status === 200 || statusRes.status === 202) {
                 const statusData = await statusRes.json();
+                // MODIFICATION: Log full statusData for non-streaming for debugging
+                console.log(`[Non-Stream ${requestId}] Poll ${attempt+1} - Fal Status Data (HTTP ${statusRes.status}):`, JSON.stringify(statusData));
+
                  if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
                     const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
                     return new Response(JSON.stringify({ error: { message: `❌ 生成失败: ${errorMsg}`, type: "generation_failed" } }),
@@ -491,19 +506,19 @@ export default {
                         }
                     } else {
                         const errorText = await resultRes.text();
-                        console.error(`Non-Stream: Fal result fetch error: ${resultRes.status} - ${errorText}`);
+                        console.error(`[Non-Stream ${requestId}] Fal result fetch error: ${resultRes.status} - ${errorText}`);
                         return new Response(JSON.stringify({ error: { message: `❌ 获取结果失败 (HTTP ${resultRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
                     }
                 }
             } else {
                 const errorText = await statusRes.text();
-                console.error(`Non-Stream: Fal status check serious error: ${statusRes.status} - ${errorText}`);
+                console.error(`[Non-Stream ${requestId}] Fal status check serious error: ${statusRes.status} - ${errorText}`);
                 return new Response(JSON.stringify({ error: { message: `❌ 检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
             }
         } catch (e) { 
-            console.error(`Non-stream polling exception: ${e.toString()}`);
+            console.error(`[Non-Stream ${requestId}] Polling exception: ${e.toString()}`, e.stack);
             return new Response(JSON.stringify({ error: { message: `❌ 轮询过程中发生错误: ${e.toString()}`, type: "server_error" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
         }
@@ -516,7 +531,6 @@ export default {
         }), { headers: { 'Content-Type': 'application/json' } });
       }
 
-      // MODIFICATION: Enhanced success message for non-streaming
       let content = isVideoModel ? `✅ 视频生成成功!\n\n` : (modelConfig["image-to-image"] ? `✅ 图像编辑成功!\n\n` : `✅ 图像生成成功!\n\n`);
       generatedArtifactUrls.forEach((url, i) => {
         if (i > 0) content += "\n\n";
@@ -529,23 +543,30 @@ export default {
       }), { headers: { 'Content-Type': 'application/json' } });
 
     } catch (e) {
-      console.error(`Overall exception in handleChatCompletions: ${e.toString()}`, e.stack);
+      console.error(`[${requestId}] Overall exception in handleChatCompletions: ${e.toString()}`, e.stack);
       return new Response(JSON.stringify({ error: { message: `❌ 服务器错误: ${e.toString()}`, type: "server_error" } }),
                          { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
   }
   
-  // MODIFICATION: Helper function for streaming error responses
   function createStreamingErrorResponse(model, errorMessageContent) {
     const requestId = Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
     const stream = new ReadableStream({
       start(controller) {
         const encoder = new TextEncoder();
-        const send = (data) => { try { if (controller.desiredSize !== null) controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`)); } catch(e){ console.warn("Stream controller closed (error response):", e.message);}};
+        let streamClosedByError = false;
+        const send = (data) => { 
+            if(streamClosedByError) return;
+            try { if (controller.desiredSize !== null) controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`)); else streamClosedByError = true; } 
+            catch(e){ console.warn("Stream controller closed (error response):", e.message); streamClosedByError = true;}
+        };
         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { content: errorMessageContent }, finish_reason: null }] });
         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-        try { if (controller.desiredSize !== null) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); }} catch(e){ console.warn("Stream controller closed (error response close):", e.message);};
+        if(!streamClosedByError) {
+            try { if (controller.desiredSize !== null) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); }} 
+            catch(e){ console.warn("Stream controller closed (error response close):", e.message);}
+        }
       }
     });
     return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } });
@@ -553,7 +574,6 @@ export default {
 
 
   function createStreamingDefaultResponse(model, message) {
-    // Uses the new createStreamingErrorResponse for consistency, but with a default message
     return createStreamingErrorResponse(model, message);
   }
 
