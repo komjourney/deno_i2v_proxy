@@ -1,18 +1,20 @@
-// deno_i2v_proxy v3
+// deno_i2v_proxy v4
 
-// deno_i2v_proxy v3 主要修改内容：
-// 1. 处理Fal.ai提交请求时HTTP 413 Payload Too Large错误：
-//    - 当客户端上传的图片过大（导致发送给Fal.ai的请求体超过4MB限制）时，脚本现在会捕获此413错误。
-//    - 并向客户端（例如Cherry Studio）返回一个清晰的错误提示，告知图片文件过大。
-// 2. 增强流式响应中控制器操作的健壮性：
-//    - 在流式响应的 `controller.enqueue()` 和 `controller.close()` 操作周围添加了 `try...catch` 块。
-//    - 目的是捕获当客户端（例如Cherry Studio）可能提前断开连接后，再对流控制器进行操作时可能抛出的
-//      `TypeError: The stream controller cannot close or enqueue` 错误。
-//    - 这可以防止Deno脚本因客户端的意外断开而记录未捕获的异常，并尝试更优雅地处理这种情况。
-// 3. 轮询超时参数调整：(此项已在v2中修改，v3保留)
-//    - `maxAttempts` for video models 保持为 `150` (配合4秒的轮询间隔，提供约10分钟的轮询时间)。
-// 4. Fal.ai状态轮询中HTTP 202 Accepted状态码处理：(此项已在v2中修改，v3保留)
-//    - 脚本会正确处理Fal.ai在任务进行中（`IN_PROGRESS` 或 `IN_QUEUE`）时返回的 `202 Accepted` HTTP状态码。
+// deno_i2v_proxy v4 主要修改内容提要：
+// 1. 尝试显示百分比进度：
+//    - 在轮询Fal.ai任务状态时，脚本现在会检查响应中是否包含 `progress` 字段。
+//    - 如果 `progress` 字段存在且为有效数字，脚本会将其转换为百分比，并尝试发送类似 "视频处理中... 进度: XX% ▓▓▓░░░░░░░" 的消息。
+//    - 如果 `progress` 字段不可用，则回退到使用动态表情符号来指示处理中。
+// 2. 优化"处理中"的流式消息：
+//    - 引入一个简单的旋转表情符号（spinner）数组，如 `["⏳", "⚙️", "💡", "🎬"]`，在没有百分比进度时，轮流显示这些表情，给用户一种动态感。
+// 3. 美化最终成功/失败消息：
+//    - 对于视频生成成功的消息，采用用户建议的格式，包含✅和🎥表情符号，以及Markdown格式的视频链接。
+//    - 对于超时或失败的消息，也加入适当的提示性表情符号，如⚠️或❌。
+// 4. 保留v3的健壮性修改：
+//    - 继续处理HTTP 413错误（图片过大）。
+//    - 继续对流控制器的操作进行`try...catch`保护。
+//    - 保留针对视频的较长轮询超时设置。
+//    - 继续正确处理Fal.ai状态轮询中的HTTP 202状态码。
 
 
 const falApiKeysEnv = Deno.env.get("FAL_API_KEYS");
@@ -174,6 +176,13 @@ export default {
     return params;
   }
 
+  // MODIFICATION: Helper function to create a simple text-based progress bar
+  function createProgressBar(progressPercentage, length = 10) {
+      const filledLength = Math.round(length * progressPercentage / 100);
+      const emptyLength = length - filledLength;
+      return `[${'▓'.repeat(filledLength)}${'░'.repeat(emptyLength)}] ${progressPercentage.toFixed(0)}%`;
+  }
+
   async function handleChatCompletions(request) {
     const authResult = extractAndValidateApiKey(request);
     if (!authResult.valid) {
@@ -259,7 +268,7 @@ export default {
     const falRequest = {};
     if (isVideoModel && klingParams) {
         falRequest.prompt = actualPromptForFal;
-        falRequest.image_url = imageUrl; // image_url is expected by kling model
+        falRequest.image_url = imageUrl;
         falRequest.duration = klingParams.duration;
         falRequest.aspect_ratio = klingParams.aspect_ratio;
         falRequest.negative_prompt = klingParams.negative_prompt;
@@ -289,28 +298,16 @@ export default {
       const headers = { "Authorization": `Key ${apiKey}`, "Content-Type": "application/json" };
       const falResponse = await fetch(falSubmitUrl, { method: 'POST', headers: headers, body: JSON.stringify(falRequest) });
       
-      // MODIFICATION START: Handle 413 Payload Too Large from Fal.ai
       if (falResponse.status === 413) {
           console.error(`Fal API Error (${falSubmitUrl}): 413 - Payload Too Large. Image likely too big.`);
-          const errorMsg413 = "错误：上传的图片文件过大，超过了4MB的限制。请尝试使用更小的图片。";
+          const errorMsg413 = "❌ 错误：上传的图片文件过大，超过了4MB的限制。请尝试使用更小的图片。";
           if (stream) {
-              const readableStream = new ReadableStream({
-                  start(controller) {
-                      const encoder = new TextEncoder();
-                      const send = (data) => { try { if (controller.desiredSize !== null) controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`)); } catch(e){ console.warn("Stream controller closed (413 error path):", e.message);}};
-                      send({ id: `chatcmpl-${Date.now().toString(36)}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-                      send({ id: `chatcmpl-${Date.now().toString(36)}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: errorMsg413 }, finish_reason: null }] });
-                      send({ id: `chatcmpl-${Date.now().toString(36)}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-                      try { if (controller.desiredSize !== null) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); }} catch(e){ console.warn("Stream controller closed (413 error path close):", e.message);};
-                  }
-              });
-              return new Response(readableStream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } });
+              return createStreamingErrorResponse(modelIdToUse, errorMsg413);
           } else {
               return new Response(JSON.stringify({ error: { message: errorMsg413, type: "invalid_request_error", code: 413 } }),
                                  { status: 413, headers: { 'Content-Type': 'application/json' } });
           }
       }
-      // MODIFICATION END: Handle 413 Payload Too Large from Fal.ai
 
       const responseText = await falResponse.text();
       if (falResponse.status !== 200 && falResponse.status !== 202) {
@@ -330,32 +327,30 @@ export default {
       let generatedArtifactUrls = [];
       const maxAttempts = isVideoModel ? 150 : 45; 
       const pollInterval = isVideoModel ? 4000 : 2500;
+      // MODIFICATION: Spinner for progress messages
+      const spinnerFrames = ["⏳", "⚙️", "💡", "🎬"];
+      let spinnerIndex = 0;
+
 
       if (stream) {
         const readableStream = new ReadableStream({
           async start(controller) {
             const encoder = new TextEncoder();
-            let streamClosedByError = false; // Flag to prevent further enqueues if controller is bad
+            let streamClosedByError = false;
 
             const send = (data) => {
                 if (streamClosedByError) return;
                 try {
-                    // Check if the stream is still active before trying to enqueue
-                    // desiredSize being null means the stream is closing or closed
                     if (controller.desiredSize === null) {
-                        console.warn("Stream controller is already closing/closed, cannot enqueue data:", data);
-                        streamClosedByError = true; // Prevent further attempts
-                        return;
+                        console.warn("Stream controller is already closing/closed, cannot enqueue data:", JSON.stringify(data).substring(0,100));
+                        streamClosedByError = true; return;
                     }
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
                 } catch (e) {
                     if (e.name === 'TypeError' && (e.message.includes('cannot close or enqueue') || e.message.includes('is closing'))) {
                         console.warn("Stream controller was already closed or in a bad state when trying to enqueue. Client likely disconnected.", e.message);
-                        streamClosedByError = true; // Prevent further attempts
-                    } else {
-                        console.error("Error enqueuing data to stream:", e);
-                        streamClosedByError = true; // Prevent further attempts on other errors too
-                    }
+                    } else { console.error("Error enqueuing data to stream:", e); }
+                    streamClosedByError = true;
                 }
             };
             
@@ -368,9 +363,20 @@ export default {
                 const statusUrl = `${falStatusBaseUrl}/requests/${requestId}/status`;
                 const resultUrl = `${falStatusBaseUrl}/requests/${requestId}`;
                 
-                if (attempt > 0 && attempt % (isVideoModel ? 2 : 4) === 0) {
-                     send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "视频仍在努力处理中..." : "图像仍在努力生成中..." }, finish_reason: null }] });
+                // MODIFICATION: Progress message logic
+                if (attempt > 0) { // Don't send progress on first attempt immediately after role chunk
+                    const statusResForProgress = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } }); // Fetch again for latest progress
+                    let progressMsgContent = `视频仍在努力处理中... ${spinnerFrames[spinnerIndex++ % spinnerFrames.length]}`;
+                    if (statusResForProgress.status === 200 || statusResForProgress.status === 202) {
+                        const currentStatusData = await statusResForProgress.json();
+                        if (typeof currentStatusData.progress === 'number' && currentStatusData.progress >= 0 && currentStatusData.progress <= 1) {
+                            const percentage = currentStatusData.progress * 100;
+                            progressMsgContent = `视频处理中... ${createProgressBar(percentage)}`;
+                        }
+                    }
+                     send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: progressMsgContent }, finish_reason: null }] });
                 }
+
 
                 const statusRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${apiKey}` } });
                 
@@ -379,7 +385,7 @@ export default {
 
                   if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
                     const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
-                    send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `生成失败: ${errorMsg}` }, finish_reason: null }] });
+                    send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 生成失败: ${errorMsg}` }, finish_reason: null }] });
                     artifactGenerated = true; break;
                   }
                   if (statusData.status === "COMPLETED") {
@@ -395,37 +401,39 @@ export default {
 
                       if (generatedArtifactUrls.length > 0) {
                         artifactGenerated = true;
-                        let successMsg = isVideoModel ? `视频生成成功!\n\n` : (modelConfig["image-to-image"] ? `图像编辑成功!\n\n` : `图像生成成功!\n\n`);
+                        // MODIFICATION: Enhanced success message
+                        let successMsg = isVideoModel ? `✅ 视频生成成功!\n\n` : (modelConfig["image-to-image"] ? `✅ 图像编辑成功!\n\n` : `✅ 图像生成成功!\n\n`);
                         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: successMsg }, finish_reason: null }] });
                         generatedArtifactUrls.forEach((url, i) => {
                           if (i > 0) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: "\n\n" }, finish_reason: null }] });
-                          send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? `视频链接: ${url}` : `![Generated ${i+1}](${url})` }, finish_reason: null }] });
+                          const linkContent = isVideoModel ? `🎥 [观看视频](${url})` : `🖼️ [查看图片 ${i+1}](${url})`;
+                          send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: linkContent }, finish_reason: null }] });
                         });
                       } else { 
                         artifactGenerated = true; 
-                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: "生成任务已完成，但未能从Fal API获取有效的输出URL。" }, finish_reason: null }] }); 
+                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: "⚠️ 生成任务已完成，但未能从Fal API获取有效的输出URL。" }, finish_reason: null }] }); 
                       }
                     } else { 
                         console.error(`Stream: Fal result fetch error: ${resultRes.status} ${await resultRes.text()}`); 
-                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `获取结果失败 (HTTP ${resultRes.status})。` }, finish_reason: null }] });
+                        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 获取结果失败 (HTTP ${resultRes.status})。` }, finish_reason: null }] });
                         artifactGenerated = true;
                     }
                   }
                 } else {
                   const errorText = await statusRes.text();
                   console.error(`Stream: Fal status check serious error: ${statusRes.status} - ${errorText}`);
-                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,100)}` }, finish_reason: null }] });
+                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,100)}` }, finish_reason: null }] });
                   artifactGenerated = true;
                 }
               } catch (e) { 
                   console.error(`Stream: Polling exception: ${e.toString()}`); 
-                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `轮询过程中发生错误: ${e.toString().substring(0,100)}` }, finish_reason: null }] });
+                  send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index:0, delta:{ content: `❌ 轮询过程中发生错误: ${e.toString().substring(0,100)}` }, finish_reason: null }] });
                   artifactGenerated = true;
               }
               if (!artifactGenerated && !streamClosedByError) { await new Promise(r => setTimeout(r, pollInterval)); attempt++; }
             }
 
-            if (!artifactGenerated && !streamClosedByError) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "视频生成超时，请稍后再试或调整参数。" : "图像生成超时，请稍后再试或调整参数。" }, finish_reason: null }] });
+            if (!artifactGenerated && !streamClosedByError) send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: { content: isVideoModel ? "⚠️ 视频生成超时，请稍后再试或调整参数。" : "⚠️ 图像生成超时，请稍后再试或调整参数。" }, finish_reason: null }] });
             
             if (!streamClosedByError) {
                 send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelIdToUse, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
@@ -462,7 +470,7 @@ export default {
                 const statusData = await statusRes.json();
                  if (statusData.status === "FAILED" || (statusData.logs && statusData.logs.some(log => log.level === "ERROR"))) {
                     const errorMsg = statusData.logs?.find(l => l.level === "ERROR")?.message || statusData.error?.message || "Generation failed at Fal API.";
-                    return new Response(JSON.stringify({ error: { message: errorMsg, type: "generation_failed" } }),
+                    return new Response(JSON.stringify({ error: { message: `❌ 生成失败: ${errorMsg}`, type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
                 }
                 if (statusData.status === "COMPLETED") {
@@ -478,40 +486,41 @@ export default {
                         if (generatedArtifactUrls.length > 0) {
                             artifactGeneratedNonStream = true; 
                         } else {
-                             return new Response(JSON.stringify({ error: { message: "生成任务已完成，但未能从Fal API获取有效的输出URL。", type: "generation_failed" } }),
+                             return new Response(JSON.stringify({ error: { message: "⚠️ 生成任务已完成，但未能从Fal API获取有效的输出URL。", type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
                         }
                     } else {
                         const errorText = await resultRes.text();
                         console.error(`Non-Stream: Fal result fetch error: ${resultRes.status} - ${errorText}`);
-                        return new Response(JSON.stringify({ error: { message: `获取结果失败 (HTTP ${resultRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
+                        return new Response(JSON.stringify({ error: { message: `❌ 获取结果失败 (HTTP ${resultRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
                     }
                 }
             } else {
                 const errorText = await statusRes.text();
                 console.error(`Non-Stream: Fal status check serious error: ${statusRes.status} - ${errorText}`);
-                return new Response(JSON.stringify({ error: { message: `检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
+                return new Response(JSON.stringify({ error: { message: `❌ 检查任务状态时出错 (HTTP ${statusRes.status}): ${errorText.substring(0,200)}`, type: "generation_failed" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
             }
         } catch (e) { 
             console.error(`Non-stream polling exception: ${e.toString()}`);
-            return new Response(JSON.stringify({ error: { message: `轮询过程中发生错误: ${e.toString()}`, type: "server_error" } }),
+            return new Response(JSON.stringify({ error: { message: `❌ 轮询过程中发生错误: ${e.toString()}`, type: "server_error" } }),
                                        { status: 500, headers: { 'Content-Type': 'application/json' } });
         }
       }
 
       if (generatedArtifactUrls.length === 0) {
         return new Response(JSON.stringify({ id: `chatcmpl-${requestId}`, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelIdToUse,
-          choices: [{ index: 0, message: { role: "assistant", content: isVideoModel ? "无法生成视频或超时，请重试。" : "无法生成图像或超时，请重试。" }, finish_reason: "stop" }],
+          choices: [{ index: 0, message: { role: "assistant", content: isVideoModel ? "⚠️ 无法生成视频或超时，请重试。" : "⚠️ 无法生成图像或超时，请重试。" }, finish_reason: "stop" }],
           usage: { prompt_tokens: Math.floor(prompt.length/4), completion_tokens: 20, total_tokens: Math.floor(prompt.length/4) + 20 }
         }), { headers: { 'Content-Type': 'application/json' } });
       }
 
-      let content = isVideoModel ? `视频生成成功!\n\n` : (modelConfig["image-to-image"] ? `图像编辑成功!\n\n` : `图像生成成功!\n\n`);
+      // MODIFICATION: Enhanced success message for non-streaming
+      let content = isVideoModel ? `✅ 视频生成成功!\n\n` : (modelConfig["image-to-image"] ? `✅ 图像编辑成功!\n\n` : `✅ 图像生成成功!\n\n`);
       generatedArtifactUrls.forEach((url, i) => {
         if (i > 0) content += "\n\n";
-        content += isVideoModel ? `视频链接: ${url}` : `![Generated ${i+1}](${url})`;
+        content += isVideoModel ? `🎥 [观看视频](${url})` : `🖼️ [查看图片 ${i+1}](${url})`;
       });
       
       return new Response(JSON.stringify({ id: `chatcmpl-${requestId}`, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelIdToUse,
@@ -521,24 +530,31 @@ export default {
 
     } catch (e) {
       console.error(`Overall exception in handleChatCompletions: ${e.toString()}`, e.stack);
-      return new Response(JSON.stringify({ error: { message: `服务器错误: ${e.toString()}`, type: "server_error" } }),
+      return new Response(JSON.stringify({ error: { message: `❌ 服务器错误: ${e.toString()}`, type: "server_error" } }),
                          { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
   }
-
-  function createStreamingDefaultResponse(model, message) {
+  
+  // MODIFICATION: Helper function for streaming error responses
+  function createStreamingErrorResponse(model, errorMessageContent) {
     const requestId = Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
     const stream = new ReadableStream({
       start(controller) {
         const encoder = new TextEncoder();
-        const send = (data) => { try { if (controller.desiredSize !== null) controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`)); } catch(e){ console.warn("Stream controller closed (default response):", e.message);}};
+        const send = (data) => { try { if (controller.desiredSize !== null) controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`)); } catch(e){ console.warn("Stream controller closed (error response):", e.message);}};
         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { content: message }, finish_reason: null }] });
+        send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: { content: errorMessageContent }, finish_reason: null }] });
         send({ id: `chatcmpl-${requestId}`, object: "chat.completion.chunk", created:Math.floor(Date.now()/1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-        try { if (controller.desiredSize !== null) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); }} catch(e){ console.warn("Stream controller closed (default response close):", e.message);};
+        try { if (controller.desiredSize !== null) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); }} catch(e){ console.warn("Stream controller closed (error response close):", e.message);};
       }
     });
     return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } });
+  }
+
+
+  function createStreamingDefaultResponse(model, message) {
+    // Uses the new createStreamingErrorResponse for consistency, but with a default message
+    return createStreamingErrorResponse(model, message);
   }
 
   async function handleImageGenerations(request) {
